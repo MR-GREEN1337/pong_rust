@@ -1,0 +1,840 @@
+File: src/server/bin/main.rs
+use std::time::Instant;
+use common::{GameState, PaddleInput};
+
+fn main() -> std::io::Result<()> {
+    // This line will be useful for you :)
+    // socket.set_nonblocking(true)?;
+    
+    // Initializing pong game state
+    let mut state = GameState::new();
+
+    // Time of the last update
+    let mut last_update = Instant::now();
+    // User input that we should receive by UDP
+    let mut paddle_input_opt: Option<PaddleInput> = None;
+
+    // Deserializing user input (replace with correct buffer)
+    // paddle_input_opt = Some(serde_json::from_slice::<PaddleInput>(&buffer).unwrap());
+    // Function to update the game state with optional user input
+    state.update(paddle_input_opt, &mut last_update);
+
+    // Serializing the game state into a json so we can send it via UDP
+    let data = serde_json::to_vec(&state).unwrap();
+    // Deserializing the paddle input sent by a client (replace with the correct buffer)
+    // serde_json::from_slice::<PaddleInput>(buffer);
+
+    // Server loop
+    // loop {
+        // You probably want to:
+        // 1. receive potential user input
+        // 2. refresh game state
+        // 3. send new game state to the players
+    // }
+
+    Ok(())
+}
+-e 
+---
+
+File: src/common/lib.rs
+use core::panic;
+use std::{io::{stdout, Write}, time::{Duration, Instant}};
+
+use serde::{Serialize, Deserialize};
+use crossterm::{cursor, execute, terminal::{self, ClearType}};
+
+#[derive(Serialize, Deserialize)]
+pub struct PaddleInput {
+    pub side: String,
+    pub direction: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GameState {
+    pub ball_x: f32,
+    pub ball_y: f32,
+    pub vel_x: f32,
+    pub vel_y: f32,
+    pub paddle_left: f32,
+    pub paddle_right: f32,
+    pub screen_height: usize,
+    pub screen_width: usize,
+    pub tick: Duration,    
+}
+
+impl GameState {
+    pub fn new() -> GameState {
+        GameState {
+            ball_x: 40.0,
+            ball_y: 12.0,
+            vel_x: 1.0,
+            vel_y: 0.5,
+            paddle_left: 10.0,
+            paddle_right: 10.0,
+            screen_height: 25,
+            screen_width: 80,
+            tick: Duration::from_millis(50),
+        }
+    }
+
+    // Update game state with optional paddle input and last update time.
+    pub fn update(&mut self, input: Option<PaddleInput>, last_update: &mut Instant) {
+        // Firstly check if some paddle input have been received
+        if let Some(paddle) = input {
+            let new_pos = match paddle.side.as_str() {
+                "left" => &mut self.paddle_left,
+                "right" => &mut self.paddle_right,
+                _ => { panic!("Wrong paddle given") }
+            };
+
+            match paddle.direction.as_str() {
+                "Up" => *new_pos -= 1.0,
+                "Down" => *new_pos += 1.0,
+                _ => panic!("Wrong direction given")
+            };
+            
+            if *new_pos < 2.0 {
+                *new_pos = 2.0;
+            } else if *new_pos > self.screen_height as f32 - 3.0 {
+                *new_pos = self.screen_height as f32 - 3.0;
+            }
+        }
+
+        // Prevent refreshing too much, otherwise the ball will be too fast.
+        // This can be tweaked with `self.tick`.
+        if last_update.elapsed() > self.tick {
+            // Update ball coordinates
+            self.ball_x += self.vel_x;
+            self.ball_y += self.vel_y;
+
+            // Bounce on top/bottom
+            if self.ball_y <= 0.0 || self.ball_y >= (self.screen_height as f32) - 1.0 {
+                self.vel_y = -self.vel_y;
+            }
+
+            // Bounce on paddle left
+            if self.ball_x <= 2.0 && (self.ball_y - self.paddle_left).abs() < 3.0 {
+                self.vel_x = self.vel_x.abs();
+            }
+
+            // Bounce on paddle right
+            if self.ball_x >= (self.screen_width as f32) - 2.0 && (self.ball_y - self.paddle_right).abs() < 3.0 {
+                self.vel_x = -self.vel_x.abs();
+            }
+
+            *last_update = Instant::now();
+        }
+    }
+
+    // Draws the game state
+    pub fn draw(&self, side: &str) {
+        let mut out = stdout();
+        let width = self.screen_width;
+        let height = self.screen_height;
+
+        // Always reset cursor position to (0, 0)
+        execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::FromCursorDown)).unwrap();
+
+        // Build screen buffer
+        let mut screen = vec![vec![' '; width]; height];
+
+        let half_paddle = 2;
+        for dy in -half_paddle..=half_paddle {
+            let yl = (self.paddle_left as i32 + dy).clamp(0, height as i32 - 1);
+            let yr = (self.paddle_right as i32 + dy).clamp(0, height as i32 - 1);
+            screen[yl as usize][1] = '|';
+            screen[yr as usize][width - 2] = '|';
+        }
+
+        let bx = self.ball_x.clamp(0.0, (width - 1) as f32) as usize;
+        let by = self.ball_y.clamp(0.0, (height - 1) as f32) as usize;
+        screen[by][bx] = '●';
+
+        // Manual write with \r\n (important!)
+        for row in screen {
+            writeln!(out, "{}\r", row.into_iter().collect::<String>()).unwrap();
+        }
+
+        writeln!(out, "\r\nYou are player '{}'. Press arrow Up/Down to move, ESC to quit.", side).unwrap();
+        out.flush().unwrap();
+    }
+}
+-e 
+---
+
+File: src/client/bin/main.rs
+use std::time::{Duration};
+use common::PaddleInput;
+use crossterm::event::{Event, KeyCode};
+use crossterm::terminal::ClearType;
+use crossterm::{cursor, event, execute, terminal};
+
+fn main() -> std::io::Result<()> { 
+    // This line will be useful for you :)
+    // socket.set_nonblocking(true)?;
+
+    // Deserializing the game state (replace with correct buffer)
+    // let state = serde_json::from_slice::<GameState>(&buffer).unwrap();
+    // The side of the player
+    let side = String::from("left");
+    // Drawing the game state
+    // state.draw(&side);
+    
+    // To communicate user input to the server we will use `PaddleInput`.
+    // `side` is String that indicates the player (left/right)
+    // `direction` is String of the user input (Up/Down)
+    let msg = PaddleInput { side: String::from("left"), direction: String::from("Up") };
+    // Serializing the msg
+    let data = serde_json::to_vec(&msg).unwrap();
+
+    terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), terminal::Clear(ClearType::All), cursor::Hide)?;
+
+    let mut paddle_direction = None;
+
+    // Handle keypresses, you will use that to get the paddle direction and change the msg content
+    // accordingly.
+    if event::poll(Duration::from_millis(10))? {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Up => paddle_direction = Some(String::from("Up")),
+                KeyCode::Down => paddle_direction = Some(String::from("Down")),
+                // Can be usefull after when you will put this code in the client loop
+                // KeyCode::Esc => break,
+                _ => {}
+            }
+        }
+    }
+
+    // Client loop
+    // loop {
+        // You probably want to:
+        // 1. get user input
+        // 2. send it to the server
+        // 3. fetch game state from the server and draw it
+    // }
+
+    // Cleanup
+    execute!(std::io::stdout(), cursor::Show)?;
+    terminal::disable_raw_mode()?;
+    Ok(())
+}
+-e 
+---
+
+File: Cargo.toml
+[package]
+name = "pong-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+[[bin]]
+name = "server"
+path = "src/server/bin/main.rs"
+
+[[bin]]
+name = "client"
+path = "src/client/bin/main.rs"
+
+[lib]
+name = "common"
+path = "src/common/lib.rs"
+
+---
+
+File: Cargo.lock
+# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "bitflags"
+version = "2.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2261d10cca569e4643e526d8dc2e62e433cc8aba21ab764233731f8d369bf394"
+
+[[package]]
+name = "cfg-if"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
+
+[[package]]
+name = "convert_case"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb402b8d4c85569410425650ce3eddc7d698ed96d39a73f941b08fb63082f1e7"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "crossterm"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
+dependencies = [
+ "bitflags",
+ "crossterm_winapi",
+ "derive_more",
+ "document-features",
+ "mio",
+ "parking_lot",
+ "rustix",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm_winapi"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
+name = "derive_more"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "093242cf7570c207c83073cf82f79706fe7b8317e98620a47d5be7c3d8497678"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda628edc44c4bb645fbe0f758797143e4e07926f7ebf4e9bdfbd3d2ce621df3"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "document-features"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95249b50c6c185bee49034bcb378a49dc2b5dff0be90ff6616d31d64febab05d"
+dependencies = [
+ "litrs",
+]
+
+[[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+
+[[package]]
+name = "libc"
+version = "0.2.177"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
+
+[[package]]
+name = "litrs"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e54036fe321fd421e10d732f155734c4e4afd610dd556d9a82833ab3ee0bed"
+
+[[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "log"
+version = "0.4.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+
+[[package]]
+name = "memchr"
+version = "2.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+
+[[package]]
+name = "mio"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78bed444cc8a2160f01cbcf811ef18cac863ad68ae8ca62092e8db51d51c761c"
+dependencies = [
+ "libc",
+ "log",
+ "wasi",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "pong-rust"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "proc-macro2"
+version = "1.0.101"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
+dependencies = [
+ "unicode-ident",
+]
+
+[[package]]
+name = "quote"
+version = "1.0.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce25767e7b499d1b604768e7cde645d14cc8584231ea6b295e9c9eb22c02e1d1"
+dependencies = [
+ "proc-macro2",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.5.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd15f8a2c5551a84d56efdc1cd049089e409ac19a3072d5037a17fd70719ff3e"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ryu"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+
+[[package]]
+name = "scopeguard"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+dependencies = [
+ "serde_core",
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_core"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.145"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34db1a06d485c9142248b7a054f034b349b212551f3dfd19c94d45a754a217cd"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a4719bff48cee6b39d12c020eeb490953ad2443b7055bd0b21fca26bd8c28b"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "smallvec"
+version = "1.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "syn"
+version = "2.0.106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ede7c438028d4436d71104916910f5bb611972c5cfd7f89b8300a8186e6fada6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f63a545481291138910575129486daeaf8ac54aee4387fe7906919f7830c7d9d"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
+dependencies = [
+ "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "windows-targets"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
+dependencies = [
+ "windows_aarch64_gnullvm",
+ "windows_aarch64_msvc",
+ "windows_i686_gnu",
+ "windows_i686_gnullvm",
+ "windows_i686_msvc",
+ "windows_x86_64_gnu",
+ "windows_x86_64_gnullvm",
+ "windows_x86_64_msvc",
+]
+
+[[package]]
+name = "windows_aarch64_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
+
+[[package]]
+name = "windows_aarch64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
+
+[[package]]
+name = "windows_i686_gnu"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
+
+[[package]]
+name = "windows_i686_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
+
+[[package]]
+name = "windows_i686_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
+
+[[package]]
+name = "windows_x86_64_gnu"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
+
+[[package]]
+name = "windows_x86_64_gnullvm"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
+
+[[package]]
+name = "windows_x86_64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+---
+
+--- DIRECTORY STRUCTURE ---
+
+Project Tree:
+.
+├── Cargo.lock
+├── Cargo.toml
+├── llm_context.sh
+├── pong_context.txt
+└── src
+    ├── client
+    │   └── bin
+    │       └── main.rs
+    ├── common
+    │   └── lib.rs
+    └── server
+        └── bin
+            └── main.rs
+
+7 directories, 7 files
+
+-----------------------
+
+### Pong UDP Rust - AI Development Assistant Context
+
+You are an expert Rust developer and network programming specialist, serving as the primary development assistant for the "Pong UDP Rust" project. Your goal is to help implement a fully functional online Pong game using UDP sockets in Rust, with a focus on understanding Rust's memory safety, network programming best practices, and online gaming architecture.
+
+#### **Project Overview**
+This is a networked Pong game implementation where:
+- **Server**: Manages game state, receives player inputs, updates game logic, and broadcasts state to clients
+- **Clients**: Two players control paddles, send inputs to server, and render game state
+- **Protocol**: UDP sockets for low-latency communication
+- **Serialization**: JSON via serde for message passing
+
+#### **Architecture & Component Structure**
+```
+src/
+├── client/
+│   └── bin/
+│       └── main.rs     # Client executable: input handling, server communication, rendering
+├── common/
+│   └── lib.rs          # Shared game logic library (GameState, paddle physics, ball movement)
+└── server/
+    └── bin/
+        └── main.rs     # Server executable: input reception, game updates, state broadcasting
+```
+
+#### **Key Technical Objectives**
+1. **Rust Fundamentals**: Master ownership, borrowing, and lifetimes for memory-safe networking code
+2. **UDP Networking**: Implement reliable-enough game communication over unreliable transport
+3. **Game Loop Design**: Create fixed timestep server updates with client interpolation
+4. **State Synchronization**: Efficiently sync game state between server and clients
+5. **Input Handling**: Low-latency player input capture and transmission
+
+#### **Core Implementation Requirements**
+
+**Server Game Loop** (`server/bin/main.rs`):
+```rust
+loop {
+    // 1. Receive potential user inputs from both clients (non-blocking)
+    // 2. Update game state (fixed timestep, collision detection, scoring)
+    // 3. Send new game state to both players
+    // 4. Handle player connections/disconnections
+}
+```
+
+**Client Game Loop** (`client/bin/main.rs`):
+```rust
+loop {
+    // 1. Capture user input (keyboard events)
+    // 2. Send input to server
+    // 3. Receive game state from server
+    // 4. Render current game state to terminal
+}
+```
+
+#### **Technical Considerations**
+
+**UDP vs TCP**:
+- UDP chosen for lower latency (no connection handshake, no retransmission delays)
+- Acceptable packet loss for real-time games
+- Application-level reliability where needed (e.g., connection handshakes)
+
+**Player Differentiation**:
+- Server must distinguish left/right players by socket address
+- Initial handshake to assign player positions
+- Include player ID in all messages
+
+**Serialization with Serde**:
+- Use `#[derive(Serialize, Deserialize)]` on shared structs
+- JSON format for human-readable debugging
+- Consider MessagePack for production efficiency
+
+#### **Security & Anti-Cheat Considerations**
+1. **Server Authority**: Server is single source of truth for game state
+2. **Input Validation**: Validate all client inputs (position bounds, movement speed limits)
+3. **Never Trust Clients**: Clients send inputs only, never game state
+4. **Rate Limiting**: Prevent input flooding attacks
+5. **Checksums**: Consider adding message integrity verification
+
+#### **Optimization Strategies**
+1. **Delta Compression**: Send only changed state components, not full state every frame
+2. **Client-Side Prediction**: Clients predict their own paddle movement for responsiveness
+3. **Server Reconciliation**: Correct client predictions with authoritative server state
+4. **Interpolation**: Smooth remote player movements between server updates
+
+#### **Your Role & Development Guidelines**
+- **Rust Best Practices**: Write idiomatic Rust with proper error handling (Result/Option types)
+- **Memory Safety**: Leverage Rust's ownership system; explain borrow checker errors clearly
+- **Documentation**: Add clear comments explaining network protocols and game logic
+- **Testing**: Suggest unit tests for game physics, integration tests for network messages
+- **Performance**: Profile and optimize hot paths (game update loop, serialization)
+- **Debugging**: Provide strategies for debugging network issues (packet logging, etc.)
+
+**Development Process**:
+1. **Analyze**: Understand the request in context of game architecture and network design
+2. **Plan**: Outline changes across client/server/common modules
+3. **Implement**: Provide complete, compilable Rust code with explanations
+4. **Validate**: Check for common pitfalls (blocking I/O, borrow checker issues, race conditions)
+5. **Enhance**: Suggest improvements for latency, security, or code quality
+
+**Commands Reference**:
+- Build: `cargo build`
+- Run server: `cargo run --bin server`
+- Run client: `cargo run --bin client`
+- Test: `cargo test`
+- Check without building: `cargo check`
+
+#### **Advanced Topics for Further Development**
+- Lag compensation techniques
+- Client-side prediction with server reconciliation
+- Interest management (what state each client needs)
+- Replay systems and deterministic simulation
+- WebSocket gateway for browser clients
+- Matchmaking and lobby systems
+
+Always ground responses in Rust's principles of safety, concurrency, and zero-cost abstractions. When uncertain about networking details or game architecture patterns, research best practices before proposing solutions.
