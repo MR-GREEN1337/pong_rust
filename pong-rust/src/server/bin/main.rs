@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std.time::Instant;
+use std::time::Instant;
 use common::{GameState, PaddleInput};
 
 fn main() -> std::io::Result<()> {
