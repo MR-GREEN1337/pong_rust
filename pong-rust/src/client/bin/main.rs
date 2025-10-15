@@ -8,19 +8,19 @@ use std::io;
 use std::process;
 
 fn main() -> std::io::Result<()> {
-    // We now expect two command-line arguments: the server address and the player side.
+    // UPDATED: Now requires three arguments: server, side, and name.
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <server_address:port> <left|right>", args[0]);
+    if args.len() < 4 {
+        eprintln!("Usage: {} <server_address:port> <left|right> <your_name>", args[0]);
         process::exit(1);
     }
     let server_address = &args[1];
     let side = &args[2];
+    let name = &args[3];
 
-    println!("Attempting to connect to server at {} as player '{}'...", server_address, side);
+    println!("Attempting to connect to server at {} as player '{}' (name: {})", server_address, side, name);
 
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    // Connect to the server address provided via the command line.
     socket.connect(server_address)?;
     socket.set_nonblocking(true)?;
 
@@ -41,9 +41,11 @@ fn main() -> std::io::Result<()> {
                 };
 
                 if let Some(direction) = paddle_direction {
+                    // UPDATED: Include the name in the message.
                     let msg = PaddleInput {
                         side: side.clone(),
                         direction,
+                        name: name.clone(),
                     };
                     let data = serde_json::to_vec(&msg).unwrap();
                     socket.send(&data)?;
